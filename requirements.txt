@@ -7,3 +7,4 @@ pillow-avif-plugin
 mediapipe
 requests
 ultralytics
+streamlit
