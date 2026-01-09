@@ -1,20 +1,24 @@
-FROM python:3.10-slim
+# Use a lightweight Python base image
+FROM python:3.9-slim
 
-# 1. 파이썬 로그 즉시 출력 설정
-ENV PYTHONUNBUFFERED True
+# Set working directory
+WORKDIR /app
 
-# 2. 작업 디렉토리 설정
-ENV APP_HOME /app
-WORKDIR $APP_HOME
+# Install system dependencies (OpenCV support)
+RUN apt-get update && apt-get install -y \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
 
-# 3. [중요] 시스템 패키지 설치 (패키지명 변경: libgl1-mesa-glx -> libgl1)
-RUN apt-get update && apt-get install -y libgl1 libglib2.0-0
-
-# 4. 파일 복사
-COPY . ./
-
-# 5. 파이썬 라이브러리 설치
+# Copy requirements and install
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 6. 서버 실행
-CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 app:app
+# Copy the app code
+COPY . .
+
+# Expose the port Cloud Run expects
+EXPOSE 8080
+
+# Run Streamlit on port 8080
+CMD streamlit run app.py --server.port=8080 --server.address=0.0.0.0
