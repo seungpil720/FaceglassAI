@@ -313,13 +313,28 @@ if face_file:
             st.header("2. Virtual Try-On")
             st.markdown(f"Upload an image of **{recs[0]}** glasses (White background or PNG).")
             
-            glasses_file = st.file_uploader("Upload Glasses Image", type=['png', 'jpg', 'jpeg'])
+            # Allow picking from uploaded server files OR uploading new ones
+            glasses_source = st.radio("Choose Glasses Source:", ["Upload New Image", "Select from Server"])
             
-            if glasses_file:
-                # Load and Clean Glasses
+            glasses_bgra = None
+            
+            if glasses_source == "Upload New Image":
+                glasses_file = st.file_uploader("Upload Glasses Image", type=['png', 'jpg', 'jpeg'])
+                if glasses_file:
+                     glasses_bgra = load_glasses_from_upload(glasses_file)
+
+            else: # Select from Server
+                # Filter for image files in current directory
+                server_files = [f for f in os.listdir('.') if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                if server_files:
+                    selected_file = st.selectbox("Select Glasses Image:", server_files)
+                    if selected_file:
+                         glasses_bgra = load_glasses_from_upload(selected_file)
+                else:
+                    st.warning("No image files found on server.")
+
+            if glasses_bgra is not None:
                 with st.spinner("Processing Glasses Image (Removing Artifacts)..."):
-                    glasses_bgra = load_glasses_from_upload(glasses_file)
-                    
                     # Debug: Show cleaned glasses
                     st.image(glasses_bgra, caption="Processed Glasses (Artifacts Removed)", channels="BGR", width=200)
 
@@ -332,7 +347,8 @@ if face_file:
                     )
                     
                     st.image(cv2.cvtColor(final_img, cv2.COLOR_BGR2RGB), caption="Virtual Try-On Result", use_column_width=True)
-            else:
-                st.info("Waiting for glasses upload...")
+            elif glasses_source == "Upload New Image" and not glasses_file:
+                 st.info("Waiting for glasses upload...")
+
     else:
         st.error("No face detected. Please upload a clear frontal photo.")
