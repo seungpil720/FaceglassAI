@@ -10,7 +10,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 # ==========================================
-# 0. CONFIG & MODEL SETUP
+# 0. 기본 설정 및 모델 로드
 # ==========================================
 st.set_page_config(page_title="AI Glasses Try-On", layout="wide")
 
@@ -19,7 +19,7 @@ def load_detector():
     model_path = "face_landmarker.task"
     if not os.path.exists(model_path):
         url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
-        with st.spinner("Downloading AI Model..."):
+        with st.spinner("AI 모델 다운로드 중..."):
             r = requests.get(url)
             with open(model_path, 'wb') as f:
                 f.write(r.content)
@@ -36,25 +36,8 @@ def load_detector():
 detector = load_detector()
 
 # ==========================================
-# 1. HELPER FUNCTIONS
+# 1. 랜드마크 및 얼굴형 분석 로직
 # ==========================================
-def 시력을_도수로_변환(시력):
-    if 시력 >= 1.0: return 0.0
-    elif 시력 >= 0.8: return -0.50
-    elif 시력 >= 0.6: return -1.00
-    elif 시력 >= 0.4: return -1.75
-    elif 시력 >= 0.3: return -2.50
-    elif 시력 >= 0.2: return -3.50
-    elif 시력 >= 0.1: return -5.00
-    else: return -6.00
-
-def 착용_빈도_판단(평균_도수):
-    도수_절댓값 = abs(평균_도수)
-    if 도수_절댓값 < 1.0: return "착용 빈도 낮음 (필요할 때만 착용)"
-    elif 도수_절댓값 < 3.0: return "착용 빈도 중간 (운전·수업·업무 시 착용 권장)"
-    elif 도수_절댓값 < 5.0: return "착용 빈도 높음 (하루 대부분 착용 필요)"
-    else: return "착용 빈도 매우 높음 (상시 착용 권장)"
-
 LM = {
     "forehead_top": 10, "chin": 152,
     "left_cheek": 234, "right_cheek": 454,
@@ -104,8 +87,25 @@ def 얼굴형_분류(비율, 균형도, 상부, 턱, 턱각):
     if 균형도 > 0.92 and 턱각 > 150: return "square"
     return "oval"
 
+def 시력을_도수로_변환(시력):
+    if 시력 >= 1.0: return 0.0
+    elif 시력 >= 0.8: return -0.50
+    elif 시력 >= 0.6: return -1.00
+    elif 시력 >= 0.4: return -1.75
+    elif 시력 >= 0.3: return -2.50
+    elif 시력 >= 0.2: return -3.50
+    elif 시력 >= 0.1: return -5.00
+    else: return -6.00
+
+def 착용_빈도_판단(평균_도수):
+    도수_절댓값 = abs(평균_도수)
+    if 도수_절댓값 < 1.0: return "착용 빈도 낮음 (필요할 때만 착용)"
+    elif 도수_절댓값 < 3.0: return "착용 빈도 중간 (운전·수업·업무 시 착용 권장)"
+    elif 도수_절댓값 < 5.0: return "착용 빈도 높음 (하루 대부분 착용 필요)"
+    else: return "착용 빈도 매우 높음 (상시 착용 권장)"
+
 # ==========================================
-# 2. IMAGE PROCESSING FUNCTIONS
+# 2. 이미지 처리 (투명 배경 및 오버레이)
 # ==========================================
 def pil_to_bgra(pil_rgba: Image.Image) -> np.ndarray:
     arr = np.array(pil_rgba.convert("RGBA"), dtype=np.uint8)
@@ -173,6 +173,7 @@ def load_glasses_from_path(file_path) -> np.ndarray:
     pil = Image.open(file_path).convert("RGBA")
     bgra = pil_to_bgra(pil)
 
+    # 흰색 배경 제거 로직 (JPG 안경 이미지 대응)
     if float(bgra[:, :, 3].mean()) > 250:
         bgra = remove_white_bg_to_alpha(bgra, thr=240)
 
@@ -187,6 +188,12 @@ def find_glasses_anchors(bgra: np.ndarray):
     
     if m.sum() == 0: return None, None, None
 
+    ys, xs = np.where(m > 0)
+    x_min, x_max = xs.min(), xs.max()
+    y_min, y_max = ys.min(), ys.max()
+    bw = float(x_max - x_min + 1)
+    bh = float(y_max - y_min + 1)
+
     n, labels, stats, centroids = cv2.connectedComponentsWithStats(m, connectivity=8)
     comps = []
     for i in range(1, n):
@@ -194,13 +201,6 @@ def find_glasses_anchors(bgra: np.ndarray):
         if area > 500:
             comps.append((area, i))
     comps.sort(reverse=True, key=lambda x: x[0])
-
-    x_min = np.where(m > 0)[1].min()
-    x_max = np.where(m > 0)[1].max()
-    y_min = np.where(m > 0)[0].min()
-    y_max = np.where(m > 0)[0].max()
-    bw = float(x_max - x_min + 1)
-    bh = float(y_max - y_min + 1)
 
     if len(comps) >= 2:
         i1, i2 = comps[0][1], comps[1][1]
@@ -261,34 +261,44 @@ def overlay_glasses_affine(img_bgr, lm, glasses_bgra, big_scale=1.45, temple_wid
     return (out * 255.0).clip(0,255).astype(np.uint8)
 
 # ==========================================
-# 3. STREAMLIT APP UI (Modified)
+# 3. STREAMLIT 웹 앱 UI
 # ==========================================
 st.title("👓 AI Smart Glasses Fitting (Real Overlay)")
-st.markdown("Select a face photo and glasses from the server to try on.")
+st.markdown("서버에 저장된 **얼굴 사진**과 **안경**을 선택하면 AI가 자동으로 합성해줍니다.")
 
-# --- File Loading Logic ---
-all_files = os.listdir('.')
-glasses_keywords = ['Glasses', 'Cat Eye'] # 안경 파일 식별 키워드
-
-# 파일 분류
-glasses_files = [f for f in all_files if any(k in f for k in glasses_keywords) and f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-face_files = [f for f in all_files if f not in glasses_files and f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif'))]
-
-glasses_files.sort()
-face_files.sort()
+# 1. 파일 목록 불러오기
+try:
+    all_files = os.listdir('.')
+    # 안경 파일 키워드 (파일명에 이 단어가 들어가면 안경으로 분류)
+    glasses_keywords = ['Glasses', 'Cat Eye', 'Aviator', 'Square', 'Round', 'Oval', 'Sunglass']
+    
+    glasses_files = [f for f in all_files if any(k.lower() in f.lower() for k in glasses_keywords) and f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    face_files = [f for f in all_files if f not in glasses_files and f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif'))]
+    
+    glasses_files.sort()
+    face_files.sort()
+except Exception as e:
+    st.error(f"파일 목록을 불러오는 중 오류 발생: {e}")
+    glasses_files = []
+    face_files = []
 
 col1, col2 = st.columns([1, 1])
 
+# --- 왼쪽 컬럼: 얼굴 선택 및 분석 ---
 with col1:
-    st.header("1. Vision & Face Analysis")
-    l_eye = st.number_input("Left Eye Vision (0.1 ~ 1.5)", 0.1, 2.0, 0.5, step=0.1)
-    r_eye = st.number_input("Right Eye Vision (0.1 ~ 1.5)", 0.1, 2.0, 0.5, step=0.1)
+    st.header("1. Face Analysis")
+    l_eye = st.number_input("Left Eye Vision", 0.1, 2.0, 0.5, step=0.1)
+    r_eye = st.number_input("Right Eye Vision", 0.1, 2.0, 0.5, step=0.1)
     
-    # [수정] 업로드 대신 서버 파일 선택
-    selected_face_file = st.selectbox("Select Face Photo (from Server):", face_files)
+    # 얼굴 사진 선택
+    if face_files:
+        selected_face_file = st.selectbox("Select Face Photo:", face_files)
+    else:
+        st.warning("얼굴 사진이 없습니다.")
+        selected_face_file = None
 
 if selected_face_file:
-    # Process Face
+    # 얼굴 로드 및 분석
     image = Image.open(selected_face_file).convert('RGB')
     img_np = np.array(image)
     img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
@@ -300,7 +310,6 @@ if selected_face_file:
     if detection_result.face_landmarks:
         lm = detection_result.face_landmarks[0]
         
-        # Calculate Logic
         l_d = 시력을_도수로_변환(l_eye)
         r_d = 시력을_도수로_변환(r_eye)
         avg_d = (l_d + r_d) / 2
@@ -314,24 +323,23 @@ if selected_face_file:
             st.success(f"**Face Shape:** {face_shape.upper()}")
             st.info(f"**Recommended:** {', '.join(recs).upper()}")
             st.warning(f"**Usage:** {freq}")
+            # 원본 얼굴 보여주기
+            st.image(image, caption="Original Face", use_column_width=True)
 
-        # --- GLASSES OVERLAY SECTION ---
+        # --- 오른쪽 컬럼: 안경 선택 및 결과 출력 ---
         with col2:
-            st.header("2. Virtual Try-On")
-            st.markdown(f"Select **{recs[0]}** glasses from the list below.")
+            st.header("2. Virtual Try-On Result")
+            st.markdown(f"**{face_shape.upper()}** 얼굴형에 어울리는 안경을 선택하세요.")
             
-            # [수정] 업로드 대신 서버 파일 선택
             if glasses_files:
-                selected_glasses_file = st.selectbox("Select Glasses (from Server):", glasses_files)
+                selected_glasses_file = st.selectbox("Select Glasses:", glasses_files)
                 
                 if selected_glasses_file:
-                    with st.spinner("Processing Glasses Image..."):
+                    with st.spinner("안경 합성 중..."):
+                        # 안경 이미지 처리 (배경 제거 등)
                         glasses_bgra = load_glasses_from_path(selected_glasses_file)
                         
-                        # Debug: Show cleaned glasses
-                        st.image(glasses_bgra, caption="Selected Glasses", channels="BGR", width=200)
-
-                        # Overlay
+                        # 오버레이 (합성) 수행
                         final_img = overlay_glasses_affine(
                             img_bgr.copy(), lm, glasses_bgra,
                             big_scale=1.45,
@@ -339,8 +347,11 @@ if selected_face_file:
                             y_offset_factor=0.12
                         )
                         
-                        st.image(cv2.cvtColor(final_img, cv2.COLOR_BGR2RGB), caption="Virtual Try-On Result", use_column_width=True)
+                        # [핵심] 최종 결과 출력
+                        final_rgb = cv2.cvtColor(final_img, cv2.COLOR_BGR2RGB)
+                        st.image(final_rgb, caption=f"Try-On: {selected_glasses_file}", use_column_width=True)
             else:
-                st.warning("No glasses images found on server.")
+                st.warning("서버에 안경 이미지가 없습니다. (파일명에 'Glasses' 포함 필요)")
     else:
-        st.error("No face detected in the selected photo.")
+        with col1:
+            st.error("얼굴을 찾을 수 없습니다. 정면 사진을 선택해주세요.")
