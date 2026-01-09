@@ -8,3 +8,4 @@ mediapipe
 requests
 ultralytics
 streamlit
+requests
