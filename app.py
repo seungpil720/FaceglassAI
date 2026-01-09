@@ -36,7 +36,7 @@ def load_detector():
 detector = load_detector()
 
 # ==========================================
-# 1. VISION LOGIC (Functions)
+# 1. HELPER FUNCTIONS
 # ==========================================
 def 시력을_도수로_변환(시력):
     if 시력 >= 1.0: return 0.0
@@ -55,9 +55,6 @@ def 착용_빈도_판단(평균_도수):
     elif 도수_절댓값 < 5.0: return "착용 빈도 높음 (하루 대부분 착용 필요)"
     else: return "착용 빈도 매우 높음 (상시 착용 권장)"
 
-# ==========================================
-# 2. FACE SHAPE LOGIC (Functions)
-# ==========================================
 LM = {
     "forehead_top": 10, "chin": 152,
     "left_cheek": 234, "right_cheek": 454,
@@ -108,7 +105,7 @@ def 얼굴형_분류(비율, 균형도, 상부, 턱, 턱각):
     return "oval"
 
 # ==========================================
-# 3. GLASSES PREPROCESSING (THE BIG FIX)
+# 2. IMAGE PROCESSING FUNCTIONS
 # ==========================================
 def pil_to_bgra(pil_rgba: Image.Image) -> np.ndarray:
     arr = np.array(pil_rgba.convert("RGBA"), dtype=np.uint8)
@@ -172,8 +169,8 @@ def remove_white_artifacts_even_if_opaque(bgra: np.ndarray, white_thr=235, strip
     a2[bright] = (a2[bright] * 0.15).astype(np.uint8)
     return cv2.merge([b,g,r,a2])
 
-def load_glasses_from_upload(uploaded_file) -> np.ndarray:
-    pil = Image.open(uploaded_file).convert("RGBA")
+def load_glasses_from_path(file_path) -> np.ndarray:
+    pil = Image.open(file_path).convert("RGBA")
     bgra = pil_to_bgra(pil)
 
     if float(bgra[:, :, 3].mean()) > 250:
@@ -184,20 +181,11 @@ def load_glasses_from_upload(uploaded_file) -> np.ndarray:
     bgra = clean_alpha(bgra, min_area=150, feather=2, close_ks=3, open_ks=3)
     return bgra
 
-# ==========================================
-# 4. OVERLAY LOGIC
-# ==========================================
 def find_glasses_anchors(bgra: np.ndarray):
     a = bgra[:, :, 3]
     _, m = cv2.threshold(a, 10, 255, cv2.THRESH_BINARY)
     
-    if m.sum() == 0: return None, None, None # Fail safe
-
-    ys, xs = np.where(m > 0)
-    x_min, x_max = xs.min(), xs.max()
-    y_min, y_max = ys.min(), ys.max()
-    bw = float(x_max - x_min + 1)
-    bh = float(y_max - y_min + 1)
+    if m.sum() == 0: return None, None, None
 
     n, labels, stats, centroids = cv2.connectedComponentsWithStats(m, connectivity=8)
     comps = []
@@ -206,6 +194,13 @@ def find_glasses_anchors(bgra: np.ndarray):
         if area > 500:
             comps.append((area, i))
     comps.sort(reverse=True, key=lambda x: x[0])
+
+    x_min = np.where(m > 0)[1].min()
+    x_max = np.where(m > 0)[1].max()
+    y_min = np.where(m > 0)[0].min()
+    y_max = np.where(m > 0)[0].max()
+    bw = float(x_max - x_min + 1)
+    bh = float(y_max - y_min + 1)
 
     if len(comps) >= 2:
         i1, i2 = comps[0][1], comps[1][1]
@@ -236,7 +231,7 @@ def overlay_glasses_affine(img_bgr, lm, glasses_bgra, big_scale=1.45, temple_wid
     temple_w = 거리(Lt, Rt)
 
     pL, pR, pB = find_glasses_anchors(glasses_bgra)
-    if pL is None: return img_bgr # Return original if processing failed
+    if pL is None: return img_bgr
 
     eye_dist = 거리(L_eye, R_eye)
     templ_dist = 거리(pL, pR)
@@ -266,10 +261,21 @@ def overlay_glasses_affine(img_bgr, lm, glasses_bgra, big_scale=1.45, temple_wid
     return (out * 255.0).clip(0,255).astype(np.uint8)
 
 # ==========================================
-# 5. STREAMLIT APP UI
+# 3. STREAMLIT APP UI (Modified)
 # ==========================================
 st.title("👓 AI Smart Glasses Fitting (Real Overlay)")
-st.markdown("Upload your face photo, check your vision, and try on REAL glasses images with automatic cleanup.")
+st.markdown("Select a face photo and glasses from the server to try on.")
+
+# --- File Loading Logic ---
+all_files = os.listdir('.')
+glasses_keywords = ['Glasses', 'Cat Eye'] # 안경 파일 식별 키워드
+
+# 파일 분류
+glasses_files = [f for f in all_files if any(k in f for k in glasses_keywords) and f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+face_files = [f for f in all_files if f not in glasses_files and f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif'))]
+
+glasses_files.sort()
+face_files.sort()
 
 col1, col2 = st.columns([1, 1])
 
@@ -278,11 +284,12 @@ with col1:
     l_eye = st.number_input("Left Eye Vision (0.1 ~ 1.5)", 0.1, 2.0, 0.5, step=0.1)
     r_eye = st.number_input("Right Eye Vision (0.1 ~ 1.5)", 0.1, 2.0, 0.5, step=0.1)
     
-    face_file = st.file_uploader("Upload Face Photo (Frontal)", type=['jpg', 'png', 'jpeg'])
+    # [수정] 업로드 대신 서버 파일 선택
+    selected_face_file = st.selectbox("Select Face Photo (from Server):", face_files)
 
-if face_file:
+if selected_face_file:
     # Process Face
-    image = Image.open(face_file).convert('RGB')
+    image = Image.open(selected_face_file).convert('RGB')
     img_np = np.array(image)
     img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     H, W = img_bgr.shape[:2]
@@ -311,44 +318,29 @@ if face_file:
         # --- GLASSES OVERLAY SECTION ---
         with col2:
             st.header("2. Virtual Try-On")
-            st.markdown(f"Upload an image of **{recs[0]}** glasses (White background or PNG).")
+            st.markdown(f"Select **{recs[0]}** glasses from the list below.")
             
-            # Allow picking from uploaded server files OR uploading new ones
-            glasses_source = st.radio("Choose Glasses Source:", ["Upload New Image", "Select from Server"])
-            
-            glasses_bgra = None
-            
-            if glasses_source == "Upload New Image":
-                glasses_file = st.file_uploader("Upload Glasses Image", type=['png', 'jpg', 'jpeg'])
-                if glasses_file:
-                     glasses_bgra = load_glasses_from_upload(glasses_file)
+            # [수정] 업로드 대신 서버 파일 선택
+            if glasses_files:
+                selected_glasses_file = st.selectbox("Select Glasses (from Server):", glasses_files)
+                
+                if selected_glasses_file:
+                    with st.spinner("Processing Glasses Image..."):
+                        glasses_bgra = load_glasses_from_path(selected_glasses_file)
+                        
+                        # Debug: Show cleaned glasses
+                        st.image(glasses_bgra, caption="Selected Glasses", channels="BGR", width=200)
 
-            else: # Select from Server
-                # Filter for image files in current directory
-                server_files = [f for f in os.listdir('.') if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                if server_files:
-                    selected_file = st.selectbox("Select Glasses Image:", server_files)
-                    if selected_file:
-                         glasses_bgra = load_glasses_from_upload(selected_file)
-                else:
-                    st.warning("No image files found on server.")
-
-            if glasses_bgra is not None:
-                with st.spinner("Processing Glasses Image (Removing Artifacts)..."):
-                    # Debug: Show cleaned glasses
-                    st.image(glasses_bgra, caption="Processed Glasses (Artifacts Removed)", channels="BGR", width=200)
-
-                    # Overlay
-                    final_img = overlay_glasses_affine(
-                        img_bgr.copy(), lm, glasses_bgra,
-                        big_scale=1.45,
-                        temple_width_factor=1.18,
-                        y_offset_factor=0.12
-                    )
-                    
-                    st.image(cv2.cvtColor(final_img, cv2.COLOR_BGR2RGB), caption="Virtual Try-On Result", use_column_width=True)
-            elif glasses_source == "Upload New Image" and not glasses_file:
-                 st.info("Waiting for glasses upload...")
-
+                        # Overlay
+                        final_img = overlay_glasses_affine(
+                            img_bgr.copy(), lm, glasses_bgra,
+                            big_scale=1.45,
+                            temple_width_factor=1.18,
+                            y_offset_factor=0.12
+                        )
+                        
+                        st.image(cv2.cvtColor(final_img, cv2.COLOR_BGR2RGB), caption="Virtual Try-On Result", use_column_width=True)
+            else:
+                st.warning("No glasses images found on server.")
     else:
-        st.error("No face detected. Please upload a clear frontal photo.")
+        st.error("No face detected in the selected photo.")
