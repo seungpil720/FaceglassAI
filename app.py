@@ -132,7 +132,7 @@ def find_anchors_robust(bgra):
     _, thresh = cv2.threshold(alpha, 10, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    pL, pR = None, None
+    pL, pR, pB = None, None, None
 
     if contours:
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
@@ -204,7 +204,7 @@ def overlay_glasses(face_img, landmarks, glasses_bgra):
     return out
 
 # ==========================================
-# 3. 메인 UI
+# 3. 메인 UI (레이아웃 수정)
 # ==========================================
 st.title("👓 AI Smart Glasses Fitting")
 st.markdown("서버에 저장된 **얼굴 사진**을 분석하고 **안경**을 가상으로 착용해보세요.")
@@ -214,7 +214,9 @@ try:
     all_files = os.listdir('.')
     img_exts = ('.png', '.jpg', '.jpeg', '.webp')
     
+    # 키워드로 안경/얼굴 파일 분류
     glasses_keywords = ['glass', 'eye', 'aviator', 'round', 'square']
+    
     glasses_files = sorted([f for f in all_files if any(k in f.lower() for k in glasses_keywords) and f.endswith(img_exts)])
     face_files = sorted([f for f in all_files if f not in glasses_files and f.endswith(img_exts)])
 except:
@@ -235,27 +237,34 @@ with col1:
         selected_face = st.selectbox("얼굴 사진 선택", face_files)
         
         if selected_face:
+            # 이미지 로드
             face_pil = Image.open(selected_face).convert("RGB")
+            # 미리보기용 리사이즈 (속도 향상)
             face_pil.thumbnail((600, 600)) 
             face_cv2 = cv2.cvtColor(np.array(face_pil), cv2.COLOR_RGB2BGR)
             h, w = face_cv2.shape[:2]
 
+            # 랜드마크 검출
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(face_cv2, cv2.COLOR_BGR2RGB))
             result = detector.detect(mp_img)
 
             if result.face_landmarks:
                 lm = result.face_landmarks[0]
                 
+                # 분석 수행
                 r, b, u, j, ang = get_face_metrics(lm, w, h)
                 shape = classify_face_shape(r, b, u, j, ang)
                 recs = VERY_SUITABLE_FRAMES.get(shape, ["square"])
+                
                 avg_d = (acuity_to_diopter(l_eye) + acuity_to_diopter(r_eye)) / 2
                 freq = check_frequency(avg_d)
 
+                # 분석 결과 표시
                 st.success(f"**얼굴형:** {shape.upper()}")
                 st.info(f"**추천 안경:** {', '.join(recs).upper()}")
                 st.warning(f"**{freq}**")
                 
+                # 얼굴 이미지 표시
                 st.image(face_pil, caption="분석된 얼굴", use_container_width=True)
             else:
                 st.error("얼굴을 찾을 수 없습니다.")
@@ -269,14 +278,16 @@ with col2:
     if glasses_files:
         selected_glass = st.selectbox("안경 선택", glasses_files)
         
+        # 버튼을 누르거나 선택하면 자동 실행
         if selected_glass and 'face_cv2' in locals() and 'lm' in locals():
             st.write("▼ 아래에서 착용 결과를 확인하세요.")
             
             try:
                 with st.spinner("안경 착용 중..."):
+                    # 안경 이미지 로드
                     g_pil = Image.open(selected_glass).convert("RGBA")
                     g_bgra = pil_to_bgra(g_pil)
-                    g_bgra = cleanup_glasses(g_bgra)
+                    g_bgra = cleanup_glasses(g_bgra) # 전처리
                     
                     # [디버깅] 처리된 안경 이미지를 먼저 보여줌 (제대로 로드되었는지 확인용)
                     st.image(g_bgra, caption="[Debug] 처리된 안경 이미지", width=150, channels="BGR")
