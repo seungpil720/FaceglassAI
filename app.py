@@ -43,186 +43,269 @@ def load_detector():
 detector = load_detector()
 
 # ==========================================
-# 1. 유틸리티 함수 (좌표, 각도 등)
+# 1. 랜드마크 & 얼굴 분석 함수
 # ==========================================
-LM = { "chin": 152, "left_temple": 127, "right_temple": 356, "nose": 168 }
-EYE = { "left": 33, "right": 263 }
+LM = {
+    "forehead_top": 10, "chin": 152,
+    "left_cheek": 234, "right_cheek": 454,
+    "left_jaw": 172, "right_jaw": 397,
+    "left_temple": 127, "right_temple": 356,
+    "left_forehead": 71, "right_forehead": 301,
+}
+EYE = {"lo": 33, "li": 133, "ri": 362, "ro": 263}
+NOSE = 168
 
-def dist(a, b):
-    return float(np.linalg.norm(a - b))
+VERY_SUITABLE_FRAMES = {
+    "oval": ["cat-eye", "square", "aviator"],
+    "round": ["square"],
+    "square": ["round"],
+    "heart": ["oval"],
+    "triangle": ["oval", "round"],
+}
 
-def get_landmark_point(landmarks, idx, w, h):
-    return np.array([landmarks[idx].x * w, landmarks[idx].y * h], dtype=np.float32)
+def dist(a, b): return float(np.linalg.norm(a - b))
+
+def angle(a, b, c):
+    ba, bc = a - b, c - b
+    cosv = np.dot(ba, bc) / (np.linalg.norm(ba)*np.linalg.norm(bc)+1e-6)
+    return np.degrees(np.arccos(np.clip(cosv, -1, 1)))
+
+def get_face_metrics(landmarks, w, h):
+    def pt(i): return np.array([landmarks[i].x*w, landmarks[i].y*h], dtype=np.float32)
+
+    face_h = dist(pt(LM["forehead_top"]), pt(LM["chin"]))
+    cheek_w = dist(pt(LM["left_cheek"]), pt(LM["right_cheek"]))
+    jaw_w = dist(pt(LM["left_jaw"]), pt(LM["right_jaw"]))
+    upper_w = max(dist(pt(LM["left_temple"]), pt(LM["right_temple"])),
+                  dist(pt(LM["left_forehead"]), pt(LM["right_forehead"])))
+
+    ratio = face_h / (cheek_w + 1e-6)
+    balance = 1 - (abs(upper_w - cheek_w) + abs(jaw_w - cheek_w)) / (2*cheek_w + 1e-6)
+    jaw_ang = angle(pt(LM["left_cheek"]), pt(LM["left_jaw"]), pt(LM["chin"]))
+    
+    return ratio, balance, upper_w, jaw_w, jaw_ang
+
+def classify_face_shape(ratio, balance, upper, jaw, jaw_ang):
+    if ratio < 1.15 and balance > 0.9: return "round"
+    if ratio > 1.28: return "oval"
+    if jaw > upper: return "triangle"
+    if upper > jaw: return "heart"
+    if balance > 0.92 and jaw_ang > 150: return "square"
+    return "oval"
+
+def acuity_to_diopter(acuity):
+    if acuity >= 1.0: return 0.0
+    elif acuity >= 0.8: return -0.50
+    elif acuity >= 0.6: return -1.00
+    elif acuity >= 0.4: return -1.75
+    elif acuity >= 0.3: return -2.50
+    elif acuity >= 0.2: return -3.50
+    elif acuity >= 0.1: return -5.00
+    else: return -6.00
+
+def check_frequency(avg_power):
+    val = abs(avg_power)
+    if val < 1.0: return "착용 빈도 낮음 (필요할 때만 착용)"
+    elif val < 3.0: return "착용 빈도 중간 (운전·수업·업무 시 착용 권장)"
+    elif val < 5.0: return "착용 빈도 높음 (하루 대부분 착용 필요)"
+    else: return "착용 빈도 매우 높음 (상시 착용 권장)"
 
 # ==========================================
-# 2. 안경 이미지 처리 (핵심 로직)
+# 2. 이미지 처리 (안경 합성 로직 개선)
 # ==========================================
-def pil_to_bgra(pil_image):
-    return cv2.cvtColor(np.array(pil_image.convert("RGBA")), cv2.COLOR_RGBA2BGRA)
+def pil_to_bgra(pil_img):
+    return cv2.cvtColor(np.array(pil_img.convert("RGBA")), cv2.COLOR_RGBA2BGRA)
 
-def cleanup_glasses_image(bgra):
-    # 흰색 배경 제거 (JPG 대응)
-    b, g, r, a = cv2.split(bgra)
-    # 밝기가 매우 밝은 영역(흰색)을 투명하게 처리
+def cleanup_glasses(bgra):
+    # 흰색 배경(JPG)을 투명하게 변환
+    b,g,r,a = cv2.split(bgra)
+    # 밝은 영역을 투명하게
     mask = (b > 240) & (g > 240) & (r > 240)
     a[mask] = 0
-    return cv2.merge([b, g, r, a])
+    return cv2.merge([b,g,r,a])
 
-def find_glasses_anchors(bgra):
+def find_anchors_robust(bgra):
     """
-    안경 이미지에서 좌/우 렌즈 중심과 브릿지(코) 위치를 찾습니다.
-    실패 시 이미지 크기 기반으로 추정치를 반환합니다 (무한 로딩 방지).
+    안경의 좌/우 렌즈 중심을 찾습니다. 
+    실패 시 이미지 비율 기반으로 강제 설정합니다 (무한 로딩 방지).
     """
     h, w = bgra.shape[:2]
     alpha = bgra[:, :, 3]
     
-    # 투명도가 아닌 영역 찾기
+    # 1. 컨투어로 찾기 시도
     _, thresh = cv2.threshold(alpha, 10, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # 컨투어가 감지되면 렌즈 위치 계산 시도
+    pL, pR, pB = None, None, None
+
     if contours:
-        # 면적이 큰 순서대로 정렬
+        # 면적순 정렬
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
-        
-        # 덩어리가 2개 이상이면 (양쪽 렌즈가 분리된 경우)
         if len(contours) >= 2:
+            # 덩어리가 2개 이상 (안경알 분리형)
             M1 = cv2.moments(contours[0])
             M2 = cv2.moments(contours[1])
-            if M1["m00"] != 0 and M2["m00"] != 0:
-                c1 = np.array([M1["m10"] / M1["m00"], M1["m01"] / M1["m00"]])
-                c2 = np.array([M2["m10"] / M2["m00"], M2["m01"] / M2["m00"]])
-                
-                # 좌우 정렬
+            if M1["m00"] > 0 and M2["m00"] > 0:
+                c1 = np.array([M1["m10"]/M1["m00"], M1["m01"]/M1["m00"]])
+                c2 = np.array([M2["m10"]/M2["m00"], M2["m01"]/M2["m00"]])
                 if c1[0] < c2[0]: pL, pR = c1, c2
                 else: pL, pR = c2, c1
-                
-                pB = (pL + pR) / 2  # 중간지점(브릿지)
-                return pL, pR, pB
-
-    # [Fallback] 컨투어 감지 실패하거나 덩어리가 1개인 경우 (테가 이어진 안경)
-    # 이미지의 1/4, 3/4 지점을 렌즈 중심으로 가정
-    pL = np.array([w * 0.25, h * 0.5])
-    pR = np.array([w * 0.75, h * 0.5])
-    pB = np.array([w * 0.50, h * 0.5])
+    
+    # 2. 실패했거나(None), 덩어리가 1개인 경우 -> 강제 설정 (Fallback)
+    if pL is None:
+        pL = np.array([w * 0.25, h * 0.5]) # 왼쪽 1/4 지점
+        pR = np.array([w * 0.75, h * 0.5]) # 오른쪽 3/4 지점
+    
+    pB = (pL + pR) / 2 # 브릿지는 중간
     return pL, pR, pB
 
 def overlay_glasses(face_img, landmarks, glasses_bgra):
     h, w = face_img.shape[:2]
     
-    # 1. 얼굴 기준 좌표 계산
-    face_L = get_landmark_point(landmarks, EYE["left"], w, h)
-    face_R = get_landmark_point(landmarks, EYE["right"], w, h)
-    face_N = get_landmark_point(landmarks, LM["nose"], w, h)
-    
-    # 2. 안경 기준 좌표 계산 (실패 없는 함수 호출)
-    glass_L, glass_R, glass_B = find_glasses_anchors(glasses_bgra)
-    
-    # 3. 크기 및 회전 계산 (Affine Transform)
-    # 소스 좌표 (안경)
-    src_pts = np.float32([glass_L, glass_R, glass_B])
-    # 타겟 좌표 (얼굴) - 눈 위치보다 약간 아래, 코 위치 고려
-    face_width = dist(face_L, face_R)
-    # 안경이 눈보다 약간 커야 하므로 스케일 조정
-    
-    # 미세 조정 파라미터
-    target_L = face_L + np.array([-face_width * 0.1, 0]) 
-    target_R = face_R + np.array([face_width * 0.1, 0])
-    target_B = face_N + np.array([0, -face_width * 0.15]) # 코보다 약간 위
+    def pt(idx): 
+        return np.array([landmarks[idx].x * w, landmarks[idx].y * h], dtype=np.float32)
 
-    dst_pts = np.float32([target_L, target_R, target_B])
+    # 얼굴 기준점
+    f_L = pt(EYE["lo"])  # 왼쪽 눈 바깥
+    f_R = pt(EYE["ro"])  # 오른쪽 눈 바깥
+    f_N = pt(NOSE)       # 코
+
+    # 안경 기준점
+    g_L, g_R, g_B = find_anchors_robust(glasses_bgra)
     
-    # 변환 행렬 계산
-    matrix = cv2.getAffineTransform(src_pts, dst_pts)
+    # 변환 좌표 계산 (눈 위치보다 살짝 바깥쪽으로 조정)
+    eye_width = float(np.linalg.norm(f_L - f_R))
+    
+    # 목표 좌표 (얼굴 위)
+    # 눈 너비의 10%만큼 바깥쪽으로 확장해서 안경이 눈을 덮도록 함
+    t_L = f_L + np.array([-eye_width * 0.15, 0])
+    t_R = f_R + np.array([eye_width * 0.15, 0])
+    t_B = f_N + np.array([0, -eye_width * 0.2]) # 코보다 약간 위
+
+    src_pts = np.float32([g_L, g_R, g_B])
+    dst_pts = np.float32([t_L, t_R, t_B])
+
+    # Affine 변환 행렬
+    M = cv2.getAffineTransform(src_pts, dst_pts)
     
     # 안경 이미지 변형
-    warped_glasses = cv2.warpAffine(
-        glasses_bgra, matrix, (w, h), 
+    warped = cv2.warpAffine(
+        glasses_bgra, M, (w, h), 
         flags=cv2.INTER_LINEAR, 
         borderMode=cv2.BORDER_CONSTANT, 
         borderValue=(0,0,0,0)
     )
     
-    # 4. 합성 (Alpha Blending)
+    # 합성 (Alpha Blending)
+    # 얼굴 이미지를 BGRA로 변환
     face_bgra = cv2.cvtColor(face_img, cv2.COLOR_BGR2BGRA)
     
     # 알파 채널 정규화 (0~1)
-    alpha_mask = warped_glasses[:, :, 3] / 255.0
-    alpha_mask = np.dstack([alpha_mask] * 3) # 3채널로 확장
+    alpha = warped[:, :, 3] / 255.0
+    alpha = np.dstack([alpha, alpha, alpha]) # 3채널로 맞춤 (BGR 대상)
+
+    # 전경(안경)과 배경(얼굴) 합성
+    fg = warped[:, :, :3]
+    bg = face_bgra[:, :, :3]
     
-    # 합성 공식: (안경 * 알파) + (얼굴 * (1-알파))
-    foreground = warped_glasses[:, :, :3]
-    background = face_bgra[:, :, :3]
-    
-    combined = (foreground * alpha_mask + background * (1.0 - alpha_mask)).astype(np.uint8)
-    return combined
+    out = (fg * alpha + bg * (1.0 - alpha)).astype(np.uint8)
+    return out
 
 # ==========================================
-# 3. 메인 UI
+# 3. 메인 UI (레이아웃 수정)
 # ==========================================
 st.title("👓 AI Smart Glasses Fitting")
-st.write("서버에 업로드된 사진을 선택하여 안경을 착용해 보세요.")
+st.markdown("서버에 저장된 **얼굴 사진**을 분석하고 **안경**을 가상으로 착용해보세요.")
 
 # 파일 목록 로드
 try:
     all_files = os.listdir('.')
     img_exts = ('.png', '.jpg', '.jpeg', '.webp')
     
-    # 파일명에 'glass'가 포함되면 안경, 아니면 얼굴로 간단 분류
-    glasses_files = sorted([f for f in all_files if 'glass' in f.lower() and f.endswith(img_exts)])
-    # glasses가 아니고, 파이썬/텍스트 파일이 아닌 것들을 얼굴 사진으로 간주
-    face_files = sorted([f for f in all_files if f not in glasses_files and f.endswith(img_exts)])
+    # 키워드로 안경/얼굴 파일 분류
+    glasses_keywords = ['glass', 'eye', 'aviator', 'round', 'square']
     
-except Exception as e:
-    st.error(f"파일 목록 로드 중 오류: {e}")
+    glasses_files = sorted([f for f in all_files if any(k in f.lower() for k in glasses_keywords) and f.endswith(img_exts)])
+    face_files = sorted([f for f in all_files if f not in glasses_files and f.endswith(img_exts)])
+except:
     glasses_files = []
     face_files = []
 
 col1, col2 = st.columns(2)
 
+# [왼쪽] 얼굴 선택 및 분석 결과
 with col1:
-    st.subheader("1. 얼굴 사진 선택")
-    if face_files:
-        selected_face = st.selectbox("얼굴 이미지", face_files)
-        if selected_face:
-            face_pil = Image.open(selected_face).convert('RGB')
-            face_cv2 = cv2.cvtColor(np.array(face_pil), cv2.COLOR_RGB2BGR)
-            st.image(face_pil, caption="선택된 얼굴", use_container_width=True)
-    else:
-        st.warning("얼굴 사진이 없습니다. (.jpg, .png 등)")
+    st.header("1. 얼굴 분석 (Face Analysis)")
+    
+    # 시력 입력
+    c1, c2 = st.columns(2)
+    with c1: l_eye = st.number_input("좌안 시력", 0.1, 2.0, 0.5, 0.1)
+    with c2: r_eye = st.number_input("우안 시력", 0.1, 2.0, 0.5, 0.1)
 
-with col2:
-    st.subheader("2. 안경 선택 및 결과")
-    if glasses_files:
-        selected_glass = st.selectbox("안경 이미지", glasses_files)
+    if face_files:
+        selected_face = st.selectbox("얼굴 사진 선택", face_files)
         
-        if selected_glass and 'face_cv2' in locals():
-            if st.button("안경 착용하기 (Click to Try-On)"):
-                with st.spinner("AI가 안경을 씌우는 중입니다..."):
-                    try:
-                        # 1. 안경 이미지 로드 및 전처리
-                        glass_pil = Image.open(selected_glass).convert("RGBA")
-                        glass_bgra = pil_to_bgra(glass_pil)
-                        glass_bgra = cleanup_glasses_image(glass_bgra)
-                        
-                        # 2. 얼굴 랜드마크 검출
-                        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(face_cv2, cv2.COLOR_BGR2RGB))
-                        detection_result = detector.detect(mp_img)
-                        
-                        if detection_result.face_landmarks:
-                            # 3. 합성 수행
-                            landmarks = detection_result.face_landmarks[0]
-                            final_img = overlay_glasses(face_cv2, landmarks, glass_bgra)
-                            
-                            # 4. 결과 출력
-                            st.image(cv2.cvtColor(final_img, cv2.COLOR_BGR2RGB), caption="착용 결과", use_container_width=True)
-                        else:
-                            st.error("사진에서 얼굴을 찾을 수 없습니다.")
-                            
-                    except Exception as e:
-                        st.error(f"합성 중 오류 발생: {e}")
-                        # 디버깅을 위해 에러 상세 출력
-                        import traceback
-                        st.text(traceback.format_exc())
+        if selected_face:
+            # 이미지 로드
+            face_pil = Image.open(selected_face).convert("RGB")
+            # 미리보기용 리사이즈 (속도 향상)
+            face_pil.thumbnail((600, 600)) 
+            face_cv2 = cv2.cvtColor(np.array(face_pil), cv2.COLOR_RGB2BGR)
+            h, w = face_cv2.shape[:2]
+
+            # 랜드마크 검출
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(face_cv2, cv2.COLOR_BGR2RGB))
+            result = detector.detect(mp_img)
+
+            if result.face_landmarks:
+                lm = result.face_landmarks[0]
+                
+                # 분석 수행
+                r, b, u, j, ang = get_face_metrics(lm, w, h)
+                shape = classify_face_shape(r, b, u, j, ang)
+                recs = VERY_SUITABLE_FRAMES.get(shape, ["square"])
+                
+                avg_d = (acuity_to_diopter(l_eye) + acuity_to_diopter(r_eye)) / 2
+                freq = check_frequency(avg_d)
+
+                # 분석 결과 표시
+                st.success(f"**얼굴형:** {shape.upper()}")
+                st.info(f"**추천 안경:** {', '.join(recs).upper()}")
+                st.warning(f"**{freq}**")
+                
+                # 얼굴 이미지 표시
+                st.image(face_pil, caption="분석된 얼굴", use_container_width=True)
+            else:
+                st.error("얼굴을 찾을 수 없습니다.")
     else:
-        st.warning("안경 이미지가 없습니다. (파일명에 'glass' 포함 필요)")
+        st.warning("얼굴 이미지가 없습니다.")
+
+# [오른쪽] 안경 선택 및 가상 피팅
+with col2:
+    st.header("2. 가상 피팅 (Virtual Try-On)")
+    
+    if glasses_files:
+        selected_glass = st.selectbox("안경 선택", glasses_files)
+        
+        # 버튼을 누르거나 선택하면 자동 실행
+        if selected_glass and 'face_cv2' in locals() and 'lm' in locals():
+            st.write("▼ 아래에서 착용 결과를 확인하세요.")
+            
+            try:
+                with st.spinner("안경 착용 중..."):
+                    # 안경 이미지 로드
+                    g_pil = Image.open(selected_glass).convert("RGBA")
+                    g_bgra = pil_to_bgra(g_pil)
+                    g_bgra = cleanup_glasses(g_bgra) # 전처리
+                    
+                    # 합성 수행 (robust 함수 사용으로 멈춤 방지)
+                    final_bgr = overlay_glasses(face_cv2, lm, g_bgra)
+                    
+                    # 결과 표시
+                    final_rgb = cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB)
+                    st.image(final_rgb, caption=f"착용 결과: {selected_glass}", use_container_width=True)
+            
+            except Exception as e:
+                st.error(f"오류 발생: {e}")
+    else:
+        st.warning("안경 이미지가 없습니다.")
